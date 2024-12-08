@@ -34,6 +34,8 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSUIElement</key>
 	<string>true</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>This app needs access to track trackpad gestures for navigation.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>GPL-3.0 licence</string>
 	<key>NSPrincipalClass</key>

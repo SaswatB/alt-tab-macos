@@ -1,81 +1,94 @@
 import Cocoa
 
-private var eventTap: CFMachPort!
-private var shouldBeEnabled: Bool!
+private var mtDevices: [MTDevice]?
+private var shouldBeEnabled: Bool = false
 
 //TODO: Should we add a sensitivity setting instead of these magic numbers?
-private let SHOW_UI_THRESHOLD: Float = 0.003
-private let CYCLE_THRESHOLD: Float = 0.04
+private let SHOW_UI_THRESHOLD: Float = 1
+private let CYCLE_THRESHOLD: Float = 5
 
 // gesture tracking state
-private var prevTouchPositions: [String: NSPoint] = [:]
 private var totalDisplacement = (x: Float(0), y: Float(0))
 private var extendNextXThreshold = false
+private var lastFingerCount: Int = 0
 
-//TODO: underlying content scrolls if both Mission Control and App Expose use 4-finger swipes or are off in Trackpad settings. It doesn't scroll if any of them use 3-finger swipe though.
 class TrackpadEvents {
     static func observe() {
         observe_()
     }
 
     static func toggle(_ enabled: Bool) {
-        shouldBeEnabled = enabled
-        if let eventTap = eventTap {
-            CGEvent.tapEnable(tap: eventTap, enable: enabled)
+        for device in mtDevices ?? [] {
+            if enabled && !shouldBeEnabled {
+                MTDeviceStart(device, 0)
+            } else if !enabled && shouldBeEnabled {
+                MTDeviceStop(device, 0)
+            }
         }
+        shouldBeEnabled = enabled
     }
 }
 
 private func observe_() {
-    // CGEvent.tapCreate returns null if ensureAccessibilityCheckboxIsChecked() didn't pass
-    eventTap = CGEvent.tapCreate(
-        tap: .cghidEventTap,
-        place: .headInsertEventTap,
-        options: .listenOnly,
-        eventsOfInterest: NSEvent.EventTypeMask.gesture.rawValue,
-        callback: eventHandler,
-        userInfo: nil)
-    if let eventTap = eventTap {
-        let runLoopSource = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
-        //TODO: Is CFRunLoopGetCurrent OK or do we need yet another thread with runLoop in BackgroundWork?
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, CFRunLoopMode.commonModes)
-    } else {
-        App.app.restart()
+    mtDevices = (MTDeviceCreateList().takeUnretainedValue() as? [MTDevice]) ?? []
+    print("mtDevices: \(mtDevices)")
+
+    for device in mtDevices ?? [] {
+        MTRegisterContactFrameCallback(device) { (device, touches, numTouches, timestamp, frame) in
+            handleTouchFrame(touches: touches!, numTouches: Int(numTouches))
+            return 0
+        }
     }
 }
 
-private func eventHandler(
-    proxy: CGEventTapProxy, type: CGEventType, cgEvent: CGEvent, userInfo: UnsafeMutableRawPointer?
-) -> Unmanaged<CGEvent>? {
-    if type.rawValue == NSEvent.EventType.gesture.rawValue, let nsEvent = NSEvent(cgEvent: cgEvent)
-    {
-        touchEventHandler(nsEvent)
-    } else if (type == .tapDisabledByUserInput || type == .tapDisabledByTimeout) && shouldBeEnabled
-    {
-        CGEvent.tapEnable(tap: eventTap!, enable: true)
-    }
-    return nil
-}
-
-private func touchEventHandler(_ nsEvent: NSEvent) {
+private func handleTouchFrame(touches: UnsafePointer<Finger>, numTouches: Int) {
     let requiredFingers = Preferences.gesture == .fourFingerSwipe ? 4 : 3
-    let touches = nsEvent.allTouches()
 
-    // Sometimes there are empty touch events that we have to skip. There are no empty touch events if Mission Control or App Expose use 3-finger swipes though.
-    if touches.isEmpty { return }
-
-    if touches.allSatisfy({ $0.phase == .ended }) || touches.count != requiredFingers {
-        if App.app.appIsBeingUsed && touches.count < requiredFingers && App.app.shortcutIndex == 5
+    // Handle touch end or incorrect finger count
+    if numTouches != requiredFingers {
+        if lastFingerCount >= requiredFingers && App.app.appIsBeingUsed
+            && App.app.shortcutIndex == 5
             && Preferences.shortcutStyle[App.app.shortcutIndex] == .focusOnRelease
         {
             DispatchQueue.main.async { App.app.focusTarget() }
         }
         clearState()
+        lastFingerCount = numTouches
         return
     }
 
-    guard let delta = calculateTouchDelta(touches) else { return }
-    let displacement = (x: totalDisplacement.x + delta.x, y: totalDisplacement.y + delta.y)
+    lastFingerCount = numTouches
+
+    // Calculate average displacement
+    var sumDelta = (x: Float(0), y: Float(0))
+    var allRight = true
+    var allLeft = true
+    var allUp = true
+    var allDown = true
+
+    for i in 0..<numTouches {
+        let touch = touches[i]
+        let delta = (
+            x: touch.normalized.velocity.x,
+            y: touch.normalized.velocity.y
+        )
+
+        allRight = allRight && delta.x > 0
+        allLeft = allLeft && delta.x < 0
+        allUp = allUp && delta.y > 0
+        allDown = allDown && delta.y < 0
+
+        sumDelta.x += delta.x
+        sumDelta.y += delta.y
+    }
+
+    // All fingers should move in the same direction
+    if !allRight && !allLeft && !allUp && !allDown { return }
+
+    let displacement = (
+        x: totalDisplacement.x + (sumDelta.x / Float(numTouches)),
+        y: totalDisplacement.y + (sumDelta.y / Float(numTouches))
+    )
     totalDisplacement = displacement
 
     // handle showing the app initially
@@ -83,8 +96,6 @@ private func touchEventHandler(_ nsEvent: NSEvent) {
         if abs(displacement.x) > SHOW_UI_THRESHOLD && abs(displacement.y) < SHOW_UI_THRESHOLD {
             DispatchQueue.main.async { App.app.showUiOrCycleSelection(5) }
             resetDisplacement(x: true, y: false)
-            // the SHOW_UI_THRESHOLD is much less then the CYCLE_THRESHOLD
-            // so for consistency when swiping, extend the threshold for the next horizontal swipe
             extendNextXThreshold = true
         }
         return
@@ -109,45 +120,7 @@ private func touchEventHandler(_ nsEvent: NSEvent) {
     }
 }
 
-private func calculateTouchDelta(_ touches: Set<NSTouch>) -> (x: Float, y: Float)? {
-    var allRight = true
-    var allLeft = true
-    var allUp = true
-    var allDown = true
-    var sumDelta = (x: Float(0), y: Float(0))
-    var count = 0
-
-    for touch in touches {
-        let prevPosition = prevTouchPositions["\(touch.identity)"]
-        let position = touch.normalizedPosition
-        if touch.phase == .ended {
-            prevTouchPositions.removeValue(forKey: "\(touch.identity)")
-        } else {
-            prevTouchPositions["\(touch.identity)"] = position
-        }
-        if prevPosition == nil { continue }
-
-        let delta = (
-            x: Float(position.x - prevPosition!.x), y: Float(position.y - prevPosition!.y)
-        )
-
-        allRight = allRight && delta.x > 0
-        allLeft = allLeft && delta.x < 0
-        allUp = allUp && delta.y > 0
-        allDown = allDown && delta.y < 0
-
-        sumDelta.x += delta.x
-        sumDelta.y += delta.y
-        count += 1
-    }
-
-    // All fingers should move in the same direction.
-    if count == 0 || (!allRight && !allLeft && !allUp && !allDown) { return nil }
-    return (x: sumDelta.x / Float(count), y: sumDelta.y / Float(count))
-}
-
 private func clearState() {
-    prevTouchPositions.removeAll()
     resetDisplacement()
     extendNextXThreshold = false
 }
